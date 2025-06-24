@@ -10,7 +10,7 @@ import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
 from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig, MicroscalingCtx, FusedActivation, FnSpecs
 from triton_kernels.matmul_ogs import can_use_persistent_tma
 from triton_kernels.matmul_ogs import matmul_ogs_set_idle_sms, matmul_ogs, matmul_ogs_torch
-from triton_kernels.swiglu import swiglu, swiglu_fn, PrecisionConfig as SwiGLUPrecisionConfig
+from triton_kernels.swiglu import swiglu, swiglu_fn, PrecisionConfig as SwiGLUPrecisionConfig, FlexCtx as SwiGLUFlexCtx
 # numerics utilities
 from triton_kernels.numerics import InFlexData, OutFlexData
 from triton_kernels.numerics_details.mxfp import SwizzlingType, downcast_to_mxfp, upcast_from_mxfp
@@ -455,9 +455,11 @@ def test_set_idle_sms():
     assert flags.idle_sms == num_idle_sms
 
 
-@pytest.mark.parametrize("m, n, k, mode", [
-    (1200, 704, 608, "ragged"),
-    (800, 800, 400, "batched"),
+@pytest.mark.parametrize("m, n, k, mode, act_dtype_str, weight_dtype_str", [
+    (1200, 704, 608, "ragged", "float16", "float16"),
+    (800, 800, 400, "batched", "float16", "float16"),
+    (512, 1280, 5120, "ragged", "float8_e4m3fn", "float8_e4m3fn"),
+    (512, 1280, 5120, "ragged", "float8_e4m3fnuz", "float8_e4m3fnuz"),
 ])
 @pytest.mark.parametrize("split_k", [1, 2])
 @pytest.mark.parametrize("do_gather, do_scatter, fused_scatter", [
@@ -477,8 +479,8 @@ def test_set_idle_sms():
     (1.0, 1.2),
     (0.7, 1.0),
 ])
-def test_fused_act(m, n, k, mode, split_k, do_gather, do_scatter, fused_scatter, is_persistent, epilogue_subtile,
-                   swiglu_alpha, swiglu_limit, device, opt_flags_scope):
+def test_fused_act(m, n, k, mode, act_dtype_str, weight_dtype_str, split_k, do_gather, do_scatter, fused_scatter, is_persistent,
+                   epilogue_subtile, swiglu_alpha, swiglu_limit, device, opt_flags_scope):
     if fused_scatter and split_k > 1:
         pytest.skip("fused scatter scratchpad not supported with split_k")
     torch.manual_seed(0)
@@ -491,7 +493,12 @@ def test_fused_act(m, n, k, mode, split_k, do_gather, do_scatter, fused_scatter,
     n_expts_tot, n_expts_act, n_expt_shards = 1, 1, 1
     opt_flags.update_opt_flags_constraints(constraints)
 
-    weight_dtype, act_dtype = torch.float16, torch.float16
+    weight_dtype = dtype_str_to_torch(weight_dtype_str)
+    act_dtype = dtype_str_to_torch(act_dtype_str)
+
+    if "float8_e4m3fnuz" in (weight_dtype_str, act_dtype_str) and not is_hip_cdna3():
+        pytest.skip("float8_e4m3fnuz only tested on AMD CDNA3 Platform")
+
     if mode == "ragged":
         m, rdata, gindx, sindx = init_routing_data(m, n_expts_tot, n_expts_act, n_expt_shards, do_gather, do_scatter,
                                                    device=device)
@@ -506,12 +513,27 @@ def test_fused_act(m, n, k, mode, split_k, do_gather, do_scatter, fused_scatter,
                                                     w.view(1, w.shape[-2], w.shape[-1]), gindx, precision_opt):
         pytest.skip("persistent TMAs not supported for this test")
 
+    if precision_opt.flex_ctx.out_data.expected_scale is not None:
+        swiglu_flex_ctx = SwiGLUFlexCtx(
+            out_data=OutFlexData(dtype=act_dtype, expected_scale=precision_opt.flex_ctx.out_data.expected_scale),
+            inp_data=InFlexData(dtype=act_dtype, scale=precision_opt.flex_ctx.out_data.expected_scale),
+        )
+    else:
+        swiglu_flex_ctx = SwiGLUFlexCtx()
+
     if mode == "batched":
         rdata, gindx, sindx = None, None, None
     a = swiglu(matmul_ogs(x, w, bias, rdata, gindx, sindx, precision_opt), swiglu_alpha,
-               precision_config=SwiGLUPrecisionConfig(swiglu_limit))
+               precision_config=SwiGLUPrecisionConfig(swiglu_limit, flex_ctx=swiglu_flex_ctx))
     b = matmul_ogs(
         x, w, bias, rdata, gindx, sindx, precision_opt,
         fused_activation=FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (swiglu_alpha, swiglu_limit),
                                          2))
-    assert_close(a, b)
+
+    def scale_to_f32(val: torch.Tensor, scale: torch.Tensor | None):
+        return val.to(torch.float32) * (scale or 1.)
+
+    assert_close(
+        scale_to_f32(a, swiglu_flex_ctx.out_data.expected_scale),
+        scale_to_f32(b, precision_opt.flex_ctx.out_data.expected_scale)
+    )
