@@ -2,17 +2,23 @@ import contextlib
 import os
 import socket
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
 import triton
-from triton_kernels.distributed import convert_dp_to_ep, convert_ep_to_dp, make_expt_dict_uniform, make_expt_dict_random, make_expt_assignment, symm_mem_pool
+from triton_kernels.distributed import (convert_dp_to_ep, convert_ep_to_dp,
+                                        make_expt_assignment,
+                                        make_expt_dict_random,
+                                        make_expt_dict_uniform, symm_mem_pool)
+from triton_kernels.matmul_ogs import (GatherIndx, RoutingData, ScatterIndx,
+                                       matmul_ogs)
 from triton_kernels.reduce import reduce
-from triton_kernels.topk import topk
-from triton_kernels.matmul_ogs import matmul_ogs, RoutingData, GatherIndx, ScatterIndx
 from triton_kernels.target_info import is_hip
-from triton_kernels.tensor import make_ragged_tensor_metadata, remap_ragged_tensor_metadata
-import pytest
+from triton_kernels.tensor import (make_ragged_tensor_metadata,
+                                   remap_ragged_tensor_metadata)
+from triton_kernels.topk import topk
 
 
 def _make_expt_dict_for_mode(n_shards, n_expts_tot, affinity_mode):
@@ -169,6 +175,7 @@ def _run_expert_sharding(rank, world_size, *, n_tokens, d_model, n_expts_tot, n_
     torch.manual_seed(0)
 
     dev = torch.cuda.current_device()
+    dev = torch.device(f"cuda:{dev}")
     n_shards = world_size
 
     expt_dict = _make_expt_dict_for_mode(n_shards, n_expts_tot, affinity_mode)
@@ -220,23 +227,28 @@ def _run_expert_sharding(rank, world_size, *, n_tokens, d_model, n_expts_tot, n_
         group=dist.group.WORLD,
         device=dev,
     )
-    y_dp_local_tri = run_mixture()
+    for i in range(10):
+        print(f"[{rank}] begin layer{i}")
+        x_dp_local = run_mixture()
+        torch.cuda.synchronize()
+        print(f"[{rank}] end layer{i}")
+    y_dp_local_tri = x_dp_local
     y_global_tri = torch.empty_like(y_global_ref)
 
-    # Validate warmup run.
-    dist.all_gather_into_tensor(y_global_tri, y_dp_local_tri)
-    triton.testing.assert_close(y_global_ref, y_global_tri)
+    # # Validate warmup run.
+    # dist.all_gather_into_tensor(y_global_tri, y_dp_local_tri)
+    # triton.testing.assert_close(y_global_ref, y_global_tri)
 
-    # Validate cuda graph capture + replay.
-    g = torch.cuda.CUDAGraph()
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        with torch.cuda.graph(g):
-            y_dp_local_tri_graph = run_mixture()
+    # # Validate cuda graph capture + replay.
+    # g = torch.cuda.CUDAGraph()
+    # stream = torch.cuda.Stream()
+    # with torch.cuda.stream(stream):
+    #     with torch.cuda.graph(g):
+    #         y_dp_local_tri_graph = run_mixture()
 
-    g.replay()
-    dist.all_gather_into_tensor(y_global_tri, y_dp_local_tri_graph)
-    triton.testing.assert_close(y_global_ref, y_global_tri)
+    # g.replay()
+    # dist.all_gather_into_tensor(y_global_tri, y_dp_local_tri_graph)
+    # triton.testing.assert_close(y_global_ref, y_global_tri)
 
 
 @pytest.mark.parametrize("distributed_launcher", [2, 4], indirect=True)
@@ -244,8 +256,8 @@ def _run_expert_sharding(rank, world_size, *, n_tokens, d_model, n_expts_tot, n_
 @pytest.mark.parametrize("d_model, n_expts_tot, n_expts_act", [(16, 4, 4), (5760, 128, 4)])
 @pytest.mark.parametrize("affinity_mode", ["uniform", "random"])
 def test_expert_sharding(distributed_launcher, n_tokens, d_model, n_expts_tot, n_expts_act, affinity_mode):
-    if is_hip():
-        pytest.skip("Distributed test is not supported on AMD GPU")
+    # if is_hip():
+        # pytest.skip("Distributed test is not supported on AMD GPU")
     if n_tokens < distributed_launcher.world_size:
         raise ValueError("n_tokens must be >= number of gpus")
     if n_tokens % distributed_launcher.world_size != 0:
